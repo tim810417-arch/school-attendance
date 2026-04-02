@@ -3,4 +3,4 @@ pandas
 openpyxl
 xlsxwriter
 pytz
-st-gsheets-connection
+requests
