@@ -2,21 +2,37 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 import pytz
-from streamlit_gsheets import GSheetsConnection
+import requests
 
 # --- 1. 系統與時區設定 ---
 ADMIN_PASSWORD = st.secrets.get("password", "admin123")
+SHEET_ID = st.secrets["SHEET_ID"]
+WEB_APP_URL = st.secrets["WEB_APP_URL"]
 tz = pytz.timezone('Asia/Taipei')
 
-# --- 2. 連接 Google Sheets ---
-conn = st.connection("gsheets", type=GSheetsConnection)
-
+# --- 2. 自製 Google Sheets 讀寫引擎 ---
 def load_data(sheet_name):
-    # ttl=0 確保每次都抓取最新資料，不使用暫存
+    # 利用 Google 官方的 CSV 匯出網址來讀取資料 (試算表必須是"知道連結者皆可編輯")
+    url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
     try:
-        return conn.read(worksheet=sheet_name, ttl=0).dropna(how="all")
+        df = pd.read_csv(url)
+        # 把所有缺失值填補為字串，避免顯示 NaN
+        return df.fillna("")
     except Exception:
         return pd.DataFrame()
+
+def save_data(sheet_name, df):
+    # 確保沒有 NaN，轉為純文字後送到 Apps Script
+    df = df.fillna("")
+    # 將 DataFrame 轉成二維陣列 [ [標題1, 標題2], [資料1, 資料2] ]
+    data = [df.columns.tolist()] + df.values.tolist()
+    payload = {"sheet": sheet_name, "data": data}
+    try:
+        res = requests.post(WEB_APP_URL, json=payload)
+        return "Success" in res.text
+    except Exception as e:
+        st.error(f"連線失敗: {e}")
+        return False
 
 def get_weekday():
     now_tw = datetime.now(tz)
@@ -24,7 +40,7 @@ def get_weekday():
     return weekdays[now_tw.weekday()]
 
 # --- 3. 網頁 UI ---
-st.set_page_config(page_title="雲端試算表點名系統", layout="wide")
+st.set_page_config(page_title="雲端點名系統", layout="wide")
 st.sidebar.title("🏫 校園點名管理")
 role = st.sidebar.radio("請選擇登入身分", ["家長查詢", "教師點名", "管理者後台"])
 
@@ -36,27 +52,30 @@ if role == "家長查詢":
     
     if st.button("登入查詢", use_container_width=True):
         df_students = load_data("Students")
-        student = df_students[df_students['班號'].astype(str) == p_id]
-        
-        if not student.empty:
-            df_pws = load_data("Passwords")
-            custom_pw = df_pws[df_pws['班號'].astype(str) == p_id]
-            correct_pw = str(custom_pw.iloc[0]['密碼']) if not custom_pw.empty else str(student.iloc[0]['學號'])
-            
-            if p_pw == correct_pw:
-                st.success(f"歡迎 {student.iloc[0]['姓名']} 家長")
-                today_str = datetime.now(tz).strftime("%Y-%m-%d")
-                df_att = load_data("Attendance")
+        if not df_students.empty:
+            student = df_students[df_students['班號'].astype(str) == p_id]
+            if not student.empty:
+                df_pws = load_data("Passwords")
+                custom_pw = df_pws[df_pws['班號'].astype(str) == p_id] if not df_pws.empty else pd.DataFrame()
                 
-                if not df_att.empty:
-                    record = df_att[(df_att['日期'] == today_str) & (df_att['班號'].astype(str) == p_id)]
-                    if not record.empty:
-                        st.metric("今日狀態", record.iloc[0]['狀態'])
-                        st.caption(f"點名時間：{record.iloc[0]['點名時間']}")
+                # 取學號的整數(若有小數點)，或自訂密碼
+                original_pw = str(student.iloc[0]['學號']).replace(".0", "")
+                correct_pw = str(custom_pw.iloc[0]['密碼']).replace(".0", "") if not custom_pw.empty else original_pw
+                
+                if p_pw == correct_pw:
+                    st.success(f"歡迎 {student.iloc[0]['姓名']} 家長")
+                    today_str = datetime.now(tz).strftime("%Y-%m-%d")
+                    df_att = load_data("Attendance")
+                    
+                    if not df_att.empty:
+                        record = df_att[(df_att['日期'].astype(str) == today_str) & (df_att['班號'].astype(str) == p_id)]
+                        if not record.empty:
+                            st.metric("今日狀態", record.iloc[0]['狀態'])
+                            st.caption(f"點名時間：{record.iloc[0]['點名時間']}")
+                        else: st.info("老師今日尚未點名")
                     else: st.info("老師今日尚未點名")
-                else: st.info("老師今日尚未點名")
-            else: st.error("密碼錯誤")
-        else: st.error("查無此班號")
+                else: st.error("密碼錯誤")
+            else: st.error("查無此班號")
 
 # --- B. 教師端 ---
 elif role == "教師點名":
@@ -70,7 +89,9 @@ elif role == "教師點名":
         if st.button("登入系統"):
             df_teachers = load_data("Teachers")
             if not df_teachers.empty:
-                teacher = df_teachers[(df_teachers['教師帳號'].astype(str) == t_acc) & (df_teachers['密碼'].astype(str) == t_pw)]
+                # 轉字串處理並忽略浮點數 .0
+                teacher = df_teachers[(df_teachers['教師帳號'].astype(str).str.replace(".0","") == t_acc) & 
+                                      (df_teachers['密碼'].astype(str).str.replace(".0","") == t_pw)]
                 if not teacher.empty:
                     st.session_state.t_user = teacher.iloc[0]['姓名']
                     st.rerun()
@@ -87,10 +108,9 @@ elif role == "教師點名":
         
         df_students = load_data("Students")
         if not df_students.empty:
-            all_classes = df_students['班級'].dropna().unique()
+            all_classes = [c for c in df_students['班級'].unique() if str(c).strip() != ""]
             target_class = st.selectbox("選擇要點名的班級", all_classes)
             
-            # 篩選今日名單
             class_list = df_students[(df_students['班級'] == target_class) & (df_students['上課日'].astype(str).str.contains(weekday))]
             
             st.write(f"📅 {today_str} (週{weekday}) | 班級：{target_class}")
@@ -106,20 +126,23 @@ elif role == "教師點名":
                     new_data.append({"日期": today_str, "班號": row['班號'], "狀態": status, "點名時間": datetime.now(tz).strftime("%H:%M:%S")})
                 
                 if st.button("送出點名紀錄", use_container_width=True):
-                    with st.spinner("正在將點名資料寫入 Google Sheets..."):
+                    with st.spinner("正在儲存至 Google Sheets..."):
                         df_att_old = load_data("Attendance")
                         
                         if not df_att_old.empty:
                             s_ids = class_list['班號'].astype(str).tolist()
-                            df_att_keep = df_att_old[~((df_att_old['日期'] == today_str) & (df_att_old['班號'].astype(str).isin(s_ids)))]
+                            df_att_keep = df_att_old[~((df_att_old['日期'].astype(str) == today_str) & (df_att_old['班號'].astype(str).isin(s_ids)))]
                             df_final = pd.concat([df_att_keep, pd.DataFrame(new_data)], ignore_index=True)
                         else:
                             df_final = pd.DataFrame(new_data)
                         
-                        # 執行寫入動作
-                        conn.update(worksheet="Attendance", data=df_final)
-                        st.cache_data.clear() # 清除網頁快取
-                    st.success("✅ 點名資料已成功寫入 Google Sheets！")
+                        # 呼叫寫入函數
+                        success = save_data("Attendance", df_final)
+                        
+                    if success:
+                        st.success("✅ 點名資料已成功寫入！")
+                    else:
+                        st.error("寫入失敗，請檢查網路或網址設定。")
         else:
             st.info("尚未匯入學生名單。")
 
@@ -138,45 +161,42 @@ elif role == "管理者後台":
             st.session_state.admin_auth = False
             st.rerun()
 
-        t1, t2 = st.tabs(["📝 Excel 名單匯入寫入", "📊 數據監控與調課"])
+        t1, t2 = st.tabs(["📝 Excel 名單匯入", "📊 數據與調課"])
         
         with t1:
-            st.subheader("1. 匯入學生名單 (自動寫入 Google Sheets)")
-            st.info("Excel 格式：分頁為班級，第一列為：班號、姓名、學號、上課日。")
+            st.subheader("1. 匯入學生名單")
             up_s = st.file_uploader("上傳學生名單 Excel", type="xlsx")
             if up_s:
-                sheets = pd.read_excel(up_s, sheet_name=None)
+                sheets = pd.read_excel(up_s, sheet_name=None, dtype=str)
                 all_s = pd.concat([df.assign(班級=n) for n, df in sheets.items()], ignore_index=True)
                 
                 if st.button("確認寫入雲端 (學生)"):
-                    with st.spinner("正在覆蓋寫入 Students 分頁..."):
-                        conn.update(worksheet="Students", data=all_s)
-                        st.cache_data.clear()
-                    st.success("🎉 學生名單已成功寫入 Google Sheets！")
+                    with st.spinner("正在寫入 Students 分頁..."):
+                        save_data("Students", all_s)
+                    st.success("🎉 學生名單已更新！")
 
             st.divider()
             
-            st.subheader("2. 匯入教師名單 (自動寫入 Google Sheets)")
-            st.info("Excel 格式：第一列為：教師帳號、姓名、密碼。")
+            st.subheader("2. 匯入教師名單")
             up_t = st.file_uploader("上傳教師名單 Excel", type="xlsx")
             if up_t:
-                df_t = pd.read_excel(up_t)
+                df_t = pd.read_excel(up_t, dtype=str)
                 
                 if st.button("確認寫入雲端 (教師)"):
-                    with st.spinner("正在覆蓋寫入 Teachers 分頁..."):
-                        conn.update(worksheet="Teachers", data=df_t)
-                        st.cache_data.clear()
-                    st.success("🎉 教師名單已成功寫入 Google Sheets！")
+                    with st.spinner("正在寫入 Teachers 分頁..."):
+                        save_data("Teachers", df_t)
+                    st.success("🎉 教師名單已更新！")
 
         with t2:
-            st.subheader("點名資料預覽 (從 Google Sheets 即時讀取)")
-            st.dataframe(load_data("Attendance"), use_container_width=True)
+            st.subheader("點名資料預覽")
+            df_att = load_data("Attendance")
+            st.dataframe(df_att, use_container_width=True)
             
             st.divider()
-            st.subheader("臨時調課 (修改 Google Sheets 上課日)")
+            st.subheader("臨時調課")
             df_students = load_data("Students")
             if not df_students.empty:
-                classes = ["全部班級"] + list(df_students['班級'].dropna().unique())
+                classes = ["全部班級"] + [c for c in df_students['班級'].unique() if str(c).strip() != ""]
                 sel_class = st.selectbox("調整班級", classes)
                 d1 = st.selectbox("原日期", ["週一", "週二", "週三", "週四", "週五"])
                 d2 = st.selectbox("對調目標", ["週一", "週二", "週三", "週四", "週五"])
@@ -188,12 +208,10 @@ elif role == "管理者後台":
                     def swap_logic(row):
                         if sel_class == "全部班級" or row['班級'] == sel_class:
                             s = str(row['上課日'])
-                            s = s.replace(d1_v, "TEMP").replace(d2_v, d1_v).replace("TEMP", d2_v)
-                            return s
+                            return s.replace(d1_v, "TEMP").replace(d2_v, d1_v).replace("TEMP", d2_v)
                         return row['上課日']
                     
-                    with st.spinner("正在更新資料庫..."):
+                    with st.spinner("正在更新調課資料..."):
                         df_students['上課日'] = df_students.apply(swap_logic, axis=1)
-                        conn.update(worksheet="Students", data=df_students)
-                        st.cache_data.clear()
-                    st.success("對調完成並已同步至 Google Sheets！")
+                        save_data("Students", df_students)
+                    st.success("對調完成！")
